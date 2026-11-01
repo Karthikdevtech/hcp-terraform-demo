@@ -16,6 +16,10 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 }
 
@@ -34,18 +38,26 @@ resource "random_pet" "server" {
 }
 
 variable "admin_ssh_public_key" {
-  description = "SSH public key for the VM administrator."
+  description = "Optional SSH public key. If omitted, Terraform generates a key stored in state."
   type        = string
+  default     = null
 }
 
 variable "admin_ssh_cidr" {
-  description = "IPv4 CIDR range allowed to connect to the VM over SSH."
+  description = "Optional IPv4 CIDR allowed to connect over SSH. SSH is blocked when omitted."
   type        = string
+  default     = null
 
   validation {
-    condition     = can(cidrnetmask(var.admin_ssh_cidr))
-    error_message = "admin_ssh_cidr must be a valid IPv4 CIDR range."
+    condition     = var.admin_ssh_cidr == null || can(cidrnetmask(var.admin_ssh_cidr))
+    error_message = "admin_ssh_cidr must be a valid IPv4 CIDR range when provided."
   }
+}
+
+resource "tls_private_key" "vm" {
+  count     = var.admin_ssh_public_key == null ? 1 : 0
+  algorithm = "RSA"
+  rsa_bits  = 4096
 }
 
 resource "azurerm_virtual_network" "vm" {
@@ -67,16 +79,19 @@ resource "azurerm_network_security_group" "vm" {
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
 
-  security_rule {
-    name                       = "allow-ssh"
-    priority                   = 1001
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "22"
-    source_address_prefix      = var.admin_ssh_cidr
-    destination_address_prefix = "*"
+  dynamic "security_rule" {
+    for_each = var.admin_ssh_cidr == null ? [] : [var.admin_ssh_cidr]
+    content {
+      name                       = "allow-ssh"
+      priority                   = 1001
+      direction                  = "Inbound"
+      access                     = "Allow"
+      protocol                   = "Tcp"
+      source_port_range          = "*"
+      destination_port_range     = "22"
+      source_address_prefix      = security_rule.value
+      destination_address_prefix = "*"
+    }
   }
 }
 
@@ -118,7 +133,7 @@ resource "azurerm_linux_virtual_machine" "vm" {
 
   admin_ssh_key {
     username   = "azureuser"
-    public_key = var.admin_ssh_public_key
+    public_key = var.admin_ssh_public_key == null ? tls_private_key.vm[0].public_key_openssh : var.admin_ssh_public_key
   }
 
   os_disk {
@@ -147,4 +162,10 @@ output "vm_public_ip_address" {
 output "vm_ssh_command" {
   value       = "ssh azureuser@${azurerm_public_ip.vm.ip_address}"
   description = "SSH command to connect to the virtual machine"
+}
+
+output "vm_ssh_private_key" {
+  value       = var.admin_ssh_public_key == null ? tls_private_key.vm[0].private_key_pem : null
+  description = "Generated SSH private key. Store securely; Terraform state also contains this key."
+  sensitive   = true
 }
